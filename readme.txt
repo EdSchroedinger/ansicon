@@ -1,9 +1,9 @@
 
 				    ANSICON
 
-			 Copyright 2005-2014 Jason Hood
+			 Copyright 2005-2019 Jason Hood
 
-			    Version 1.71.  Freeware
+			    Version 1.89.  Freeware
 
 
 Description
@@ -23,23 +23,32 @@ Requirements
 Installation
 ============
 
-    Add "x86" (if your OS is 32-bit) or "x64" (if 64-bit) to your PATH, or copy
-    the relevant files to a directory already on the PATH.  Alternatively, use
-    option '-i' (or '-I', if permitted) to install it permanently, by adding an
-    entry to CMD.EXE's AutoRun registry value (current user or local machine,
-    respectively).
+    There are three ways to install, depending on your usage.
 
-    Uninstall simply involves closing any programs that are currently using it;
-    running with '-u' (and/or '-U') to remove it from AutoRun; removing the
-    directory from PATH; and deleting the files.  No other changes are made
-    (although you may have also created environment variables).
+    * Add "x86" (if your OS is 32-bit) or "x64" (if 64-bit) to your PATH, or
+      copy the relevant files to a directory already on the PATH (but NOT to
+      "System32" on a 64-bit system).  This means you explicitly run 'ansicon'
+      whenever you want to use it.
+
+    * Use option '-i' (or '-I', if permitted) to add an entry to CMD.EXE's
+      AutoRun registry value (current user or local machine, respectively).
+      This means "Command Prompt" and any program started by CMD.EXE will
+      automatically have sequences.
+
+    * Add "d:\path\to\ansicon.exe -p" to your Startup group (run minimized to
+      avoid the console window flashing).  This means any console program
+      started by Explorer will automatically have sequences.
+
+    Uninstall involves closing any programs that are currently using it; using
+    the Run dialog to run "d:\path\to\ansicon.exe -pu" to remove it from
+    Explorer; running with '-u' (and/or '-U') to remove it from AutoRun; remov-
+    ing the directory from PATH; and deleting the files.  No other changes are
+    made (unless you created environment variables).
 
 Upgrading
 ---------
 
-    Delete ANSI.dll, it has been replaced with ANSI32.dll.
-    Delete ANSI-LLA.exe and ANSI-LLW.exe, they are no longer used.
-    Uninstall a pre-1.50 version and reinstall with this version.
+    Delete ANSICON_API - it has switched from WriteFile to WriteConsoleA.
 
 
 Usage
@@ -51,6 +60,8 @@ Usage
 
 	-p	Enable the parent process (i.e. the command shell used to run
 		ANSICON) to recognise escapes.
+
+	-pu	Unload from the parent process, restoring it.
 
 	-m	Set the current (and default) attribute to grey on black
 		("monochrome"), or the attribute following the 'm' (please
@@ -82,7 +93,7 @@ Usage
 
     If you experience trouble with certain programs, the log may help in find-
     ing the cause; it can be found at "%TEMP%\ansicon.log".  A number should
-    follow the 'l':
+    immediately follow the 'l':
 
 	0	No logging
 	1	Log process start and end
@@ -91,6 +102,7 @@ Usage
 	4	Log console output (add to any of the above)
 	8	Append to the existing file (add to any of the above)
        16	Log all imported modules (add to any of the above)
+       32	Log CreateFile (add to any of the above)
 
     The log option will not work with '-p'; set the environment variable
     ANSICON_LOG (to the number) instead.  The variable is only read once when a
@@ -110,9 +122,10 @@ Usage
     The variable is updated whenever a program reads it directly (i.e. as an
     individual request, not as part of the entire environment block).  For
     example, 'set an' will not update it, but 'echo %ansicon%' will.  Also
-    created is ANSICON_VER, which contains the version without the point (1.50
-    becomes "150").  This variable does not exist as part of the environment
-    block ('set an' will not show it).
+    created are ANSICON_VER, which contains the version without the point (1.80
+    becomes "180"), and CLICOLOR (see http://bixense.com/clicolors/), which
+    contains "1".  These variables do not exist as part of the environment
+    block (e.g. 'set an' will not show ANSICON_VER).
 
     If installed, GUI programs will not be hooked.  Either start the program
     directly with 'ansicon', or add it to the ANSICON_GUI variable (see
@@ -120,17 +133,25 @@ Usage
 
     Using 'ansicon' after install will always start with the default attrib-
     utes, restoring the originals on exit; all other programs will use the cur-
-    rent attributes.  The shift state is always reset for a new process.
+    rent attributes.  The shift state and insert mode are always reset for a
+    new process.
 
-    The Windows API WriteFile and WriteConsoleA functions will set the number
-    of characters written, not the number of bytes.  When using a multibyte
-    character set, this results in a smaller number (since multiple bytes are
-    used to represent a single character).  Some programs recognise this as a
-    reduced write and will inadvertently repeat previous characters.  If you
-    discover such a program, use the ANSICON_API environment variable to record
-    it and override the API, returning the original byte count.  Ruby (prior to
-    1.9.3) is an example of such a program, so use 'set ANSICON_API=ruby' to
-    avoid the repitition.  The full syntax is:
+    ANSICON will detect when a line wraps at the right margin and suppress a
+    following newline.	Some programs detect the wrap themselves and so the
+    following newline is actually for a blank line; use the ANSICON_WRAP
+    variable to indicate as such (see ANSICON_API below).
+
+    My version of WriteConsoleA will always set the number of characters writt-
+    en, not the number of bytes.  This means writing a double-byte character as
+    two bytes will set 0 the first write (nothing was written) and 1 the second
+    (when the character was actually written); Windows normally sets 1 for both
+    writes.  Similarly, writing the individual bytes of a multibyte character
+    will set 0 for all but the last byte, then 1 on the last; Windows normally
+    sets 1 for each byte, writing the undefined character.  However, my
+    WriteFile (and _lwrite/_hwrite) will always set what was received; Windows,
+    using a multibyte character set (but not DBCS), would set the characters.
+    You can have WriteConsoleA return the original byte count by using the
+    ANSICON_API environment variable:
 
 	ANSICON_API=[!]program;program;program...
 
@@ -145,13 +166,19 @@ Usage
 Sequences Recognised
 ====================
 
-    The following escape sequences are recognised.
+    The following escape sequences are recognised (see "sequences.txt" for a
+    more complete description).
 
 	\e]0;titleBEL		xterm: Set window's title (and icon, ignored)
 	\e]2;titleBEL		xterm: Set window's title
+	\e]4;...BEL		xterm: Change color(s)
+	\e]104;...BEL		xterm: Reset color(s)
 	\e[21t			xterm: Report window's title
 	\e[s			ANSI.SYS: Save Cursor Position
 	\e[u			ANSI.SYS: Restore Cursor Position
+	\e[1+h		ACFM	Flush Mode (flush immediately)
+	\e[1+l		ACFM	Flush Mode (flush when necessary)
+	BEL		BEL	Bell
 	\e[#Z		CBT	Cursor Backward Tabulation
 	\e[#G		CHA	Cursor Character Absolute
 	\e[#I		CHT	Cursor Forward Tabulation
@@ -164,11 +191,25 @@ Sequences Recognised
 	\e[#C		CUF	Cursor Right
 	\e[#;#H 	CUP	Cursor Position
 	\e[#A		CUU	Cursor Up
+	\e[c		DA	Device Attributes
 	\e[#P		DCH	Delete Character
-	\e[?7h		DECAWM	DEC Autowrap Mode (autowrap)
-	\e[?7l		DECAWM	DEC Autowrap Mode (no autowrap) 
-	\e[?25h 	DECTCEM DEC Text Cursor Enable Mode (show cursor)
-	\e[?25l 	DECTCEM DEC Text Cursor Enable Mode (hide cursor)
+	\e[?7h		DECAWM	Autowrap Mode (autowrap)
+	\e[?7l		DECAWM	Autowrap Mode (no autowrap)
+	\e[?3h		DECCOLM Selecting 80 or 132 Columns per Page (132)
+	\e[?3l		DECCOLM Selecting 80 or 132 Columns per Page (prior)
+	\e[?95h 	DECNCSM No Clearing Screen On Column Change Mode (keep)
+	\e[?95l 	DECNCSM No Clearing Screen On Column Change Mode (clear)
+	\e[?6h		DECOM	Origin Mode (top margin)
+	\e[?6l		DECOM	Origin Mode (top line)
+	\e[#;#;#...,~	DECPS	Play Sound
+	\e8		DECRC	Restore Cursor
+	\e7		DECSC	Save Cursor
+	\e[?5W		DECST8C Set Tab at Every 8 Columns
+	\e[?5;#W	DECST8C Set Tab at Every # Columns (ANSICON extension)
+	\e[#;#r 	DECSTBM Set Top and Bottom Margins
+	\e[!p		DECSTR	Soft Terminal Reset
+	\e[?25h 	DECTCEM Text Cursor Enable Mode (show cursor)
+	\e[?25l 	DECTCEM Text Cursor Enable Mode (hide cursor)
 	\e[#M		DL	Delete Line
 	\e[#n		DSR	Device Status Report
 	\e[#X		ECH	Erase Character
@@ -177,22 +218,40 @@ Sequences Recognised
 	\e[#`		HPA	Character Position Absolute
 	\e[#j		HPB	Character Position Backward
 	\e[#a		HPR	Character Position Forward
+	HT		HT	Character Tabulation
+	\eH		HTS	Character Tabulation Set
 	\e[#;#f 	HVP	Character And Line Position
 	\e[#@		ICH	Insert Character
 	\e[#L		IL	Insert Line
+	\eD		IND	Index
+	\e[4h		IRM	Insertion Replacement Mode (insert)
+	\e[4l		IRM	Insertion Replacement Mode (replace)
 	SI		LS0	Locking-shift Zero (see below)
 	SO		LS1	Locking-shift One
+	\eE		NEL	Next Line
 	\e[#b		REP	Repeat
+	\eM		RI	Reverse Index
+	\ec		RIS	Reset to Initial State
+	\e(0		SCS	Select Character Set (DEC special graphics)
+	\e(B		SCS	Select Character Set (ASCII)
 	\e[#;#;#m	SGR	Select Graphic Rendition
+	\e[#T		SD	Scroll Down/Pan Up
+	\e[#S		SU	Scroll Up/Pan Down
+	\e[#g		TBC	Tabulation Clear
 	\e[#d		VPA	Line Position Absolute
 	\e[#k		VPB	Line Position Backward
 	\e[#e		VPR	Line Position Forward
 
     '\e' represents the escape character (ASCII 27); '#' represents a decimal
-    number (optional, in most cases defaulting to 1); BEL, SO and SI are ASCII
-    7, 14 and 15.  Regarding SGR: bold will set the foreground intensity; blink
-    and underline will set the background intensity; conceal uses background as
-    foreground.  See "sequences.txt" for a more complete description.
+    number (optional, in most cases defaulting to 1); BEL, HT, SO and SI are
+    ASCII 7, 9, 14 and 15.
+
+    Escape followed by a control character will display that character, not
+    perform its function; an unrecognised character will preserve the escape.
+
+    SO will select the G1 character set; SI will select the G0 set.  The G0
+    character set is set by SCS; the G1 character set is always the DEC Special
+    Graphics Character Set.
 
     I make a distinction between '\e[m' and '\e[0;...m'.  Both will restore the
     original foreground/background colors (and so '0' should be the first para-
@@ -208,20 +267,6 @@ Sequences Recognised
     scroll in a new window.
 
 
-Sequences Ignored
-=================
-
-    The following escape sequences are explicitly ignored.
-
-	\e(?		Designate G0 character set ('?' is any character).
-	\e)?		Designate G1 character set ('?' is any character).
-	\e[?... 	Private sequence
-	\e[>... 	Private sequence
-
-    The G0 character set is always ASCII; the G1 character set is always the
-    DEC Special Graphics Character Set.
-
-
 DEC Special Graphics Character Set
 ==================================
 
@@ -231,7 +276,7 @@ DEC Special Graphics Character Set
 
 	Char	Unicode Code Point & Name
 	----	-------------------------
-	_	U+00A0	No-Break Space (blank)
+	_	U+00A0	No-Break Space
 	`	U+2666	Black Diamond Suit
 	a	U+2592	Medium Shade
 	b	U+2409	Symbol For Horizontal Tabulation
@@ -247,11 +292,11 @@ DEC Special Graphics Character Set
 	l	U+250C	Box Drawings Light Down And Right
 	m	U+2514	Box Drawings Light Up And Right
 	n	U+253C	Box Drawings Light Vertical And Horizontal
-	o	U+00AF	Macron (SCAN 1)
-	p	U+25AC	Black Rectangle (SCAN 3)
+	o	U+23BA	Horizontal Scan Line-1
+	p	U+23BB	Horizontal Scan Line-3
 	q	U+2500	Box Drawings Light Horizontal (SCAN 5)
-	r	U+005F	Low Line (SCAN 7)
-	s	U+005F	Low Line (SCAN 9)
+	r	U+23BC	Horizontal Scan Line-7
+	s	U+23BD	Horizontal Scan Line-9
 	t	U+251C	Box Drawings Light Vertical And Right
 	u	U+2524	Box Drawings Light Vertical And Left
 	v	U+2534	Box Drawings Light Up And Horizontal
@@ -274,10 +319,11 @@ DEC Special Graphics Character Set
 Limitations
 ===========
 
-    Line sequences use the window; column sequences use the buffer.
-    Tabs are fixed at eight columns.
+    Tabs can only be set up to column 2048.
+    The saved position will not be restored correctly if the buffer scrolls.
+    Palette sequences only work from Vista.
 
-    There's a conflict with NVIDIA's drivers, requiring the setting of the
+    There may be a conflict with NVIDIA's drivers, requiring the setting of the
     Environment Variable:
 
 	ANSICON_EXC=nvd3d9wrap.dll;nvd3d9wrapx.dll
@@ -285,14 +331,113 @@ Limitations
     An application using multiple screen buffers will not have separate
     attributes in each buffer.
 
+    Console input that is echoed will not be processed (which is probably a
+    good thing for escapes, but not so good for margins).
+
 
 Version History
 ===============
 
     Legend: + added, - bug-fixed, * changed.
 
+    1.89 - 29 April, 2019:
+    - fix occasional freeze on startup (bug converting 8-digit window handle).
+
+    1.88 - 1 March, 2019:
+    - fix ANSICON environment variable when there is no console.
+
+    1.87 - 3 February, 2019:
+    - fix crash when some programs start (bug during hooking);
+    - properly hook SetCurrentConsoleFontEx.
+
+    1.86 - 4 November, 2018:
+    - check the DLL exists before importing it (allows renaming to update);
+    - unhook on terminate, as well (fixes issues with Vista and MinGW).
+
+    1.85 - 23 August, 2018:
+    - fix wrap issues with a buffer bigger than the window;
+    - fix -e et al when redirecting to NUL;
+    - prevent -p from injecting when already injected;
+    - fix running directly via ansicon (hook even if it's GUI or excluded);
+    - preserve last error;
+    + add log level 32 to monitor CreateFile.
+
+    1.84 - 11 May, 2018:
+    - close the flush handles on detach;
+    - WriteFile wasn't properly testing if its handle was for a console;
+    - use remote load on Win8+ if the process has no IAT;
+    - fix logging really long command lines;
+    - default to 7 or -7 if ANSICON_DEF could not be parsed;
+    - workaround for a Windows 10 1803 console bug (doubled CMD prompt);
+    * remove dependency on CRT & USER32, dynamically load WINMM;
+    * exit process if the primary thread is detached (for processes on Win10
+      that return, rather than call ExitProcess);
+    * ansicon.exe statically loads the DLL;
+    * scrolling will use the default attribute for new lines.
+
+    1.83 - 16 February, 2018:
+    - create the flush thread on first use.
+
+    1.82 - 13 February, 2018:
+    - add ANSICON_WRAP for programs that expect the wrap at right margin;
+    - make IsConsoleHandle a critical section, for multithreaded processes;
+    - use APIConsole for all console functions (Windows 10).
+
+    1.81 - 28 December, 2017:
+    - fix multiple CRs before LF (including preventing an immediate flush);
+    - fix CR, BS and partial RM during CRM;
+    - fix buffer overflow caused by incorrect critical section;
+    * support the entire 256-color palette;
+    * setting color by index or RGB will use the nearest console color;
+    * setting color by index will leave bold/underline unchanged.
+
+    1.80 - 24 December, 2017:
+    - fix unloading;
+    - fix -e et al when redirecting to CON;
+    - hook CreateFile and CreateConsoleScreenBuffer to force read/write access
+      (fixes redirecting to CON and Microsoft's conio);
+    - fix cursor report with duplicated digits (e.g. "11" was only writing "1");
+    - fix issues with CRM;
+    - fix explicit zero parameters not defaulting to 1;
+    - set color by index (also setting bold/underline);
+    - fix processes that start without a window;
+    - hide the cursor when moving (prevent it displaying on the active buffer
+      when moving on another);
+    * use the system default sound for the bell;
+    * limit parameters to a maximum value of 32767;
+    * go back to saving the buffer cursor position;
+    * preserve escape that isn't part of a sequence;
+    * escaped control characters will display the control;
+    * change the graphics SCAN characters to their Unicode equivalents;
+    * BS/CR/CUB/HVP after wrap will move back to the previous line(s);
+    * improve speed by only flushing when necessary, adding a mode to restore
+      flushing immediately;
+    + added DA, DECCOLM, DECNCSM, DECOM, DECPS, DECRC, DECSC, DECST8C, DECSTBM,
+      DECSTR, HT, HTS, IND, IRM, NEL, RI, RIS, SCS (only G0 as Special/ASCII),
+      SD, SU and TBC;
+    + added '+' intermediate byte to use the buffer, rather than the window;
+    + added set/get palette sequences;
+    + added the bright SGR colors;
+    + added -pu to unload from the parent.
+
+    1.72 - 24 December, 2015:
+    - handle STD_OUTPUT_HANDLE & STD_ERROR_HANDLE in WriteFile;
+    - better handling of unusual PE files;
+    * cache GetConsoleMode for an improvement in speed;
+    * files writing to the console always succeed (should mostly remove the
+      need for ANSICON_API);
+    * log: add a blank line between processes;
+	   remove the separate line for WriteFile & _lwrite;
+	   write byte strings as-is, wide strings using the current code page;
+	   use caret notation for control characters, with hexadecimal "^xNN"
+	    and "^uNNNN" for characters not in the code page (custom printf);
+    * join multibyte characters split across separate writes;
+    * remove wcstok, avoiding potential interference with the host program;
+    * similarly, remove malloc & friends, using a private heap;
+    + add CLICOLOR dynamic environment variable.
+
     1.71 - 23 October, 2015:
-    + add _CRT_NON_CONFORMING_WCSTOK define
+    + add _CRT_NON_CONFORMING_WCSTOK define for VS2015.
 
     1.70 - 26 February, 2014:
     - don't hook again if using LoadLibrary or LoadLibraryEx;
@@ -478,6 +623,11 @@ Acknowledgments
     Leigh Hebblethwaite for documentation tweaks.
 
     Vincent Fatica for pointing out \e[K was not right.
+    Nat Kuhn for pointing out the problem with report cursor position.
+    Michel Kempeneers for discovering the buffer wrap issue.
+    Jean-Luc Gautier for pointing out the problem with redirecting -e to NUL.
+
+    Thiadmer Riemersma for the nearest color algorithm.
 
 
 Contact
@@ -500,5 +650,5 @@ Distribution
     in LICENSE.txt.
 
 
-==============================
-Jason Hood, 26 February, 2014.
+===========================
+Jason Hood, 29 April, 2019.

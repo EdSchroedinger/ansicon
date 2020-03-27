@@ -85,13 +85,24 @@
     use Unicode output (_O_U16TEXT, for compilers/systems that support it);
     log: 64-bit addresses get an underscore between the 8-digit groups;
 	 add error codes to some message.
+
+  v1.80, 28 October & 30 November, 2017:
+    write newline with _putws, not putwchar (fixes redirecting to CON);
+    use -pu to unload from the parent.
+
+  v1.84, 7 May, 2018:
+    import the DLL.
+
+  v1.85, 22 & 23 August, 2018:
+    use IsConsoleHandle for my_fputws, to distinguish NUL;
+    don't load into the parent if already loaded;
+    add log level 32 to log CreateFile.
 */
 
-#define PDATE L"26 February, 2014"
+#define PDATE L"29 April, 2019"
 
 #include "ansicon.h"
 #include "version.h"
-#include <tlhelp32.h>
 #include <ctype.h>
 #include <fcntl.h>
 #include <io.h>
@@ -125,25 +136,6 @@ BOOL   GetParentProcessInfo( LPPROCESS_INFORMATION ppi, LPTSTR );
 
 
 static HANDLE hConOut;
-static WORD   wAttr;
-
-void get_original_attr( void )
-{
-  CONSOLE_SCREEN_BUFFER_INFO csbi;
-
-  hConOut = CreateFile( L"CONOUT$", GENERIC_READ | GENERIC_WRITE,
-				    FILE_SHARE_READ | FILE_SHARE_WRITE,
-				    NULL, OPEN_EXISTING, 0, 0 );
-  GetConsoleScreenBufferInfo( hConOut, &csbi );
-  wAttr = csbi.wAttributes;
-}
-
-
-void set_original_attr( void )
-{
-  SetConsoleTextAttribute( hConOut, wAttr );
-  CloseHandle( hConOut );
-}
 
 
 // The fputws function in MSVCRT.DLL (Windows 7 x64) is broken for Unicode
@@ -153,7 +145,7 @@ void set_original_attr( void )
 // heck, DIY.
 int my_fputws( const wchar_t* s, FILE* f )
 {
-  if (_isatty( _fileno( f ) ))
+  if (IsConsoleHandle( (HANDLE)_get_osfhandle( _fileno( f ) ) ))
   {
     DWORD written;
     WriteConsole( hConOut, s, (DWORD)wcslen( s ), &written, NULL );
@@ -169,60 +161,15 @@ int my_fputws( const wchar_t* s, FILE* f )
 #define _putws( s ) my_fputws( s L"\n", stdout )
 
 
-#if defined(_WIN64)
-LPTSTR DllNameType;
-#endif
-
-// Find the name of the DLL and inject it.
-BOOL Inject( LPPROCESS_INFORMATION ppi, BOOL* gui, LPCTSTR app )
-{
-  DWORD len;
-  int	type;
-  PBYTE base;
-
-#ifdef _WIN64
-  if (app != NULL)
-#endif
-  DEBUGSTR( 1, L"%s (%lu)", app, ppi->dwProcessId );
-  type = ProcessType( ppi, &base, gui );
-  if (type <= 0)
-  {
-    if (type == 0)
-      fwprintf( stderr, L"ANSICON: %s: unsupported process.\n", app );
-    return FALSE;
-  }
-
-  len = (DWORD)(prog - prog_path);
-  memcpy( DllName, prog_path, TSIZE(len) );
-#ifdef _WIN64
-  wsprintf( DllName + len, L"ANSI%d.dll", (type == 48) ? 64 : type );
-  DllNameType = DllName + len + 4;
-  set_ansi_dll();
-  if (type == 64)
-    InjectDLL( ppi, base );
-  else if (type == 32)
-    InjectDLL32( ppi, base );
-  else // (type == 48)
-    InjectDLL64( ppi );
-#else
-  wcscpy( DllName + len, L"ANSI32.dll" );
-  set_ansi_dll();
-  InjectDLL( ppi, base );
-#endif
-
-  return TRUE;
-}
-
-
-// Use CreateRemoteThread to load our DLL in the target process.
-void RemoteLoad( LPPROCESS_INFORMATION ppi, LPCTSTR app )
+// Use CreateRemoteThread to (un)load our DLL in the target process.
+void RemoteLoad( LPPROCESS_INFORMATION ppi, LPCTSTR app, BOOL unload )
 {
   HANDLE hSnap;
   MODULEENTRY32 me;
-  PBYTE  LLW;
+  PBYTE  proc;
+  DWORD  rva;
   BOOL	 fOk;
-  DWORD  len;
-  LPVOID mem;
+  LPVOID param;
   HANDLE thread;
   DWORD  ticks;
 #ifdef _WIN64
@@ -230,7 +177,7 @@ void RemoteLoad( LPPROCESS_INFORMATION ppi, LPCTSTR app )
   int	 type;
 #endif
 
-  DEBUGSTR( 1, L"%s (%lu)", app, ppi->dwProcessId );
+  DEBUGSTR( 1, "Parent = %S (%u)", app, ppi->dwProcessId );
 
   // Find the base address of kernel32.dll.
   ticks = GetTickCount();
@@ -242,7 +189,7 @@ void RemoteLoad( LPPROCESS_INFORMATION ppi, LPCTSTR app )
 #ifndef _WIN64
     if (err == ERROR_PARTIAL_COPY)
     {
-      DEBUGSTR( 1, L"  Ignoring 64-bit process (use x64\\ansicon)" );
+      DEBUGSTR( 1, "  Ignoring 64-bit process (use x64\\ansicon)" );
       fputws( L"ANSICON: parent is 64-bit (use x64\\ansicon).\n", stderr );
       return;
     }
@@ -251,56 +198,90 @@ void RemoteLoad( LPPROCESS_INFORMATION ppi, LPCTSTR app )
     // two seconds to avoid a potentially infinite loop.
     if (err == ERROR_BAD_LENGTH && GetTickCount() - ticks < 2000)
     {
-      Sleep( 0 );
+      Sleep( 1 );
       continue;
     }
-    DEBUGSTR( 1, L"  Unable to create snapshot (%lu)", err );
+    DEBUGSTR( 1, "  Unable to create snapshot (%u)", err );
   no_go:
     fputws( L"ANSICON: unable to inject into parent.\n", stderr );
     return;
   }
-  LLW = NULL;
+  proc = param = NULL;
+#ifdef _WIN64
+  type = 64;
+  if (IsWow64Process( ppi->hProcess, &WOW64 ) && WOW64)
+  {
+    type = 32;
+    *(PDWORD)DllNameType = 0x320033/*L'23'*/;
+  }
+#endif
   me.dwSize = sizeof(MODULEENTRY32);
   for (fOk = Module32First( hSnap, &me ); fOk; fOk = Module32Next( hSnap, &me ))
   {
     if (_wcsicmp( me.szModule, L"kernel32.dll" ) == 0)
     {
-      LLW = me.modBaseAddr;
-      break;
+      proc = me.modBaseAddr;
+      if (param)
+	break;
+    }
+    else
+    {
+#ifdef _WIN64
+      if (_wcsicmp( me.szModule, DllNameType - 4 ) == 0)
+#else
+      if (_wcsicmp( me.szModule, L"ANSI32.dll" ) == 0)
+#endif
+      {
+	param = me.modBaseAddr;
+	if (proc)
+	  break;
+      }
     }
   }
   CloseHandle( hSnap );
-  if (LLW == NULL)
+  if (proc == NULL)
   {
-    DEBUGSTR( 1, L"  Unable to locate kernel32.dll (%lu)", GetLastError() );
+    DEBUGSTR( 1, "  Unable to locate kernel32.dll" );
     goto no_go;
   }
+  if (unload && param == NULL)
+  {
+    DEBUGSTR( 1, "  Unable to locate ANSICON's DLL" );
+    return;
+  }
+  else if (!unload && param != NULL)
+  {
+    DEBUGSTR( 1, "  ANSICON already loaded" );
+    return;
+  }
 
-  len = (DWORD)(prog - prog_path);
-  memcpy( DllName, prog_path, TSIZE(len) );
 #ifdef _WIN64
-  type = (IsWow64Process( ppi->hProcess, &WOW64 ) && WOW64) ? 32 : 64;
-  wsprintf( DllName + len, L"ANSI%d.dll", type );
-  LLW += GetProcRVA( L"kernel32.dll", "LoadLibraryW", type );
+  rva = GetProcRVA( L"kernel32.dll", (unload) ? "FreeLibrary"
+					      : "LoadLibraryW", type );
 #else
-  wcscpy( DllName + len, L"ANSI32.dll" );
-  LLW += GetProcRVA( L"kernel32.dll", "LoadLibraryW" );
+  rva = GetProcRVA( L"kernel32.dll", unload ? "FreeLibrary" : "LoadLibraryW" );
 #endif
-  if (LLW == me.modBaseAddr)
+  if (rva == 0)
     goto no_go;
+  proc += rva;
 
-  mem = VirtualAllocEx( ppi->hProcess, NULL, len, MEM_COMMIT, PAGE_READWRITE );
-  if (mem == NULL)
+  if (!unload)
   {
-    DEBUGSTR( 1, L"  Unable to allocate virtual memory (%lu)", GetLastError() );
-    goto no_go;
+    DWORD len = TSIZE((DWORD)wcslen( DllName ) + 1);
+    param = VirtualAllocEx(ppi->hProcess, NULL, len, MEM_COMMIT,PAGE_READWRITE);
+    if (param == NULL)
+    {
+      DEBUGSTR(1, "  Failed to allocate virtual memory (%u)", GetLastError());
+      goto no_go;
+    }
+    WriteProcMem( param, DllName, len );
   }
-  WriteProcMem( mem, DllName, TSIZE(len + 11) );
   thread = CreateRemoteThread( ppi->hProcess, NULL, 4096,
-			       (LPTHREAD_START_ROUTINE)LLW, mem, 0, NULL );
+			       (LPTHREAD_START_ROUTINE)proc, param, 0, NULL );
   WaitForSingleObject( thread, INFINITE );
   CloseHandle( thread );
-  VirtualFreeEx( ppi->hProcess, mem, 0, MEM_RELEASE );
+  if (!unload)
+    VirtualFreeEx( ppi->hProcess, param, 0, MEM_RELEASE );
 }
 
 
@@ -317,7 +298,6 @@ int main( void )
   LPTSTR  argv, arg, cmd;
   TCHAR   buf[4];
   BOOL	  shell, run, gui;
-  HMODULE ansi;
   DWORD   len;
   int	  rc = 0;
 
@@ -332,7 +312,9 @@ int main( void )
     _setmode( 2, _O_U16TEXT);
 
   // Create a console handle and store the current attributes.
-  get_original_attr();
+  hConOut = CreateFile( L"CONOUT$", GENERIC_READ | GENERIC_WRITE,
+				    FILE_SHARE_READ | FILE_SHARE_WRITE,
+				    NULL, OPEN_EXISTING, 0, 0 );
 
   argv = GetCommandLine();
   len = (DWORD)wcslen( argv ) + 1;
@@ -357,7 +339,6 @@ int main( void )
     }
   }
 
-  prog = get_program_name( NULL );
   *buf = '\0';
   GetEnvironmentVariable( L"ANSICON_LOG", buf, lenof(buf) );
   log_level = _wtoi( buf );
@@ -369,12 +350,17 @@ int main( void )
     pi.hProcess = OpenProcess( PROCESS_ALL_ACCESS, FALSE, pi.dwProcessId );
     if (pi.hProcess == NULL)
     {
-      DEBUGSTR( 1, L"  Unable to open process %lu (%lu)",
+      DEBUGSTR( 1, "  Unable to open process %u (%u)",
 		   pi.dwProcessId, GetLastError() );
     }
     else
     {
-      Inject( &pi, &gui, NULL );
+      PBYTE base;
+      DEBUGSTR( 1, "64-bit process (%u) started by 32-bit", pi.dwProcessId );
+      if (ProcessType( &pi, &base, NULL ) == 48)
+	RemoteLoad64( &pi );
+      else
+	InjectDLL( &pi, base );
       CloseHandle( pi.hProcess );
     }
     return 0;
@@ -407,11 +393,13 @@ int main( void )
 	// else fall through
 
       case 'p':
+      {
+	BOOL unload = (arg[1] == 'p' && arg[2] == 'u');
 	shell = FALSE;
 	if (GetParentProcessInfo( &pi, arg ))
 	{
 	  pi.hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pi.dwProcessId);
-	  RemoteLoad( &pi, arg );
+	  RemoteLoad( &pi, arg, unload );
 	  CloseHandle( pi.hProcess );
 	}
 	else
@@ -420,22 +408,11 @@ int main( void )
 	  rc = 1;
 	}
 	break;
+      }
 
       case 'm':
-      {
-	int a = wcstol( arg + 2, NULL, 16 );
-	if (a == 0)
-	  a = (arg[2] == '-') ? -7 : 7;
-	if (a < 0)
-	{
-	  SetEnvironmentVariable( L"ANSICON_REVERSE", L"1" );
-	  a = -a;
-	  a = ((a >> 4) & 15) | ((a & 15) << 4);
-	}
-	SetConsoleTextAttribute( hConOut, (WORD)a );
-	SetEnvironmentVariable( L"ANSICON_DEF", NULL );
+	SetEnvironmentVariable( L"ANSICON_DEF", arg[2] ? arg + 2 : L"7" );
 	break;
-      }
 
       case 'e':
       case 'E':
@@ -460,35 +437,25 @@ arg_out:
   }
 
   // Ensure the default attributes are the current attributes.
-  if (GetEnvironmentVariable( L"ANSICON_DEF", buf, lenof(buf) ) != 0)
-  {
-    int a = wcstol( buf, NULL, 16 );
-    if (a < 0)
-      a = ((-a >> 4) & 15) | ((-a & 15) << 4);
-    SetConsoleTextAttribute( hConOut, (WORD)a );
-  }
+  WriteConsole( hConOut, L"\33[m", 3, &len, NULL );
 
   if (run)
   {
     if (*cmd == '\0')
     {
-      if (GetEnvironmentVariable( L"ComSpec", arg, MAX_PATH ))
-	cmd = arg;
-      else
+      if (!GetEnvironmentVariable( L"ComSpec", arg, MAX_PATH ))
       {
 	// CreateProcessW writes to the string, so can't simply point to "cmd".
-	static TCHAR cmdstr[] = L"cmd";
-	cmd = cmdstr;
+	wcscpy( arg, L"cmd" );
       }
+      cmd = arg;
     }
 
     ZeroMemory( &si, sizeof(si) );
     si.cb = sizeof(si);
-    if (CreateProcess( NULL, cmd, NULL, NULL, TRUE, CREATE_SUSPENDED,
-		       NULL, NULL, &si, &pi ))
+    if (CreateProcess( NULL, cmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi ))
     {
-      Inject( &pi, &gui, arg );
-      ResumeThread( pi.hThread );
+      ProcessType( &pi, NULL, &gui );
       if (!gui)
       {
 	SetConsoleCtrlHandler( (PHANDLER_ROUTINE)CtrlHandler, TRUE );
@@ -506,20 +473,14 @@ arg_out:
   }
   else if (*arg)
   {
-    ansi = LoadLibrary( ANSIDLL );
-    if (ansi == NULL)
-    {
-      print_error( ANSIDLL );
-      rc = 1;
-    }
-    else if (*arg == 'e' || *arg == 'E')
+    if (*arg == 'e' || *arg == 'E')
     {
       cmd += 2;
       if (*cmd == ' ' || *cmd == '\t')
 	++cmd;
       fputws( cmd, stdout );
       if (*arg == 'e')
-	putwchar( '\n' );
+	_putws( L"" );
     }
     else // (*arg == 't' || *arg == 'T')
     {
@@ -533,17 +494,14 @@ arg_out:
 	{
 	  wprintf( L"==> %s <==\n", arg );
 	  display( arg, title );
-	  putwchar( '\n' );
+	  _putws( L"" );
 	}
 	else
 	  display( arg, title );
 	get_file( arg, &argv, &cmd );
       } while (*arg);
     }
-    FreeLibrary( ansi );
   }
-
-  set_original_attr();
 
   return rc;
 }
@@ -575,7 +533,7 @@ void display( LPCTSTR name, BOOL title )
   }
   if (title)
   {
-    putwchar( '\n' );
+    _putws( L"" );
     // Need to flush, otherwise it's written *after* STD_OUTPUT_HANDLE should
     // it be redirected.
     fflush( stdout );
@@ -738,7 +696,7 @@ BOOL GetParentProcessInfo( LPPROCESS_INFORMATION ppi, LPTSTR name )
   hSnap = CreateToolhelp32Snapshot( TH32CS_SNAPPROCESS, 0 );
   if (hSnap == INVALID_HANDLE_VALUE)
   {
-    DEBUGSTR( 1, L"Failed to create snapshot (%lu)", GetLastError() );
+    DEBUGSTR( 1, "Failed to create snapshot (%u)", GetLastError() );
     return FALSE;
   }
 
@@ -747,7 +705,7 @@ BOOL GetParentProcessInfo( LPPROCESS_INFORMATION ppi, LPTSTR name )
   CloseHandle( hSnap );
   if (!fOk)
   {
-    DEBUGSTR( 1, L"Failed to locate parent" );
+    DEBUGSTR( 1, "Failed to locate parent" );
     return FALSE;
   }
 
@@ -913,24 +871,25 @@ L"http://ansicon.adoxa.vze.com/\n"
 L"\n"
 L"Process ANSI escape sequences in " WINTYPE L" console programs.\n"
 L"\n"
-L"ansicon [-l<level>] [-i] [-I] [-u] [-U] [-m[<attr>]] [-p]\n"
-L"        [-e|E string | -t|T [file(s)] | program [args]]\n"
+L"ansicon [-lLEVEL] [-i] [-I] [-u] [-U] [-m[ATTR]] [-p[u]]\n"
+L"        [-e|E STRING | -t|T [FILE...] | PROGRAM [ARGS]]\n"
 L"\n"
 L"  -l\t\tset the logging level (1=process, 2=module, 3=function,\n"
-L"    \t\t +4=output, +8=append) for program (-p is unaffected)\n"
+L"    \t\t +4=output, +8=append, +16=imports, +32=files) for PROGRAM\n"
 L"  -i\t\tinstall - add ANSICON to CMD's AutoRun entry (also implies -p)\n"
 L"  -u\t\tuninstall - remove ANSICON from the AutoRun entry\n"
 L"  -I -U\t\tuse local machine instead of current user\n"
-L"  -m\t\tuse grey on black (\"monochrome\") or <attr> as default color\n"
+L"  -m\t\tuse grey on black (\"monochrome\") or ATTR as default color\n"
 L"  -p\t\thook into the parent process\n"
-L"  -e\t\techo string\n"
-L"  -E\t\techo string, don't append newline\n"
+L"  -pu\t\tunhook from the parent process\n"
+L"  -e\t\techo STRING\n"
+L"  -E\t\techo STRING, don't append newline\n"
 L"  -t\t\tdisplay files (\"-\" for stdin), combined as a single stream\n"
 L"  -T\t\tdisplay files, name first, blank line before and after\n"
-L"  program\trun the specified program\n"
+L"  PROGRAM\trun the specified program\n"
 L"  nothing\trun a new command processor, or display stdin if redirected\n"
 L"\n"
-L"<attr> is one or two hexadecimal digits; please use \"COLOR /?\" for details.\n"
+L"ATTR is one or two hexadecimal digits; please use \"COLOR /?\" for details.\n"
 L"It may start with '-' to reverse foreground and background (but not for -p)."
 	);
 }
